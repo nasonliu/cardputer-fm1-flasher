@@ -3,7 +3,7 @@
 #include <Arduino.h>
 #include <string.h>
 
-#include "sd.h"
+#include "sdcard.h"
 #include "uboot_host.h"
 #include "ui.h"
 
@@ -38,10 +38,12 @@ EnterResult enter_download_mode(const EnterHooks &h, uint32_t timeout_ms, usbkey
     if (h.answered) h.answered(kr == usbkey::ANSWER_ACK);
     usbkey::PulseResult pr = usbkey::calibrate(h.cancel);
     if (pr.rmt_error) {
+        usbkey::restore_usb_serial();
         ulog("Could not start the pulse generator.");
         return ENTER_FAILED;
     }
     if (pr.cancelled) {
+        usbkey::restore_usb_serial();
         ulog("Stopped during calibration.");
         return ENTER_CANCELLED;
     }
@@ -71,6 +73,33 @@ static Unit identify_unit(const jl::Info &info) {
 // ---------------------------------------------------------------------------
 // USB host and loader
 
+const char *flash_chip_name(uint32_t flash_id) {
+    switch (flash_id) {
+        case 0x856014:
+            return "P25Q80H (old)";
+        case 0xB36014:
+            return "UC25HQ80 (new)";
+        case 0xEB6014:
+            return "SMK-37 (EB6014)";
+        default:
+            return "Unknown";
+    }
+}
+
+static ConnectResult finish_connect(jl::Info *info, char *err, size_t errlen) {
+    if (!jl::start(info, ulog, err, errlen)) {
+        ulog("%s", err);
+        return CONN_LOADER_FAILED;
+    }
+    ulog("Loader M-Flasher %s at %08lX, %u MHz", info->loader, (unsigned long)info->loader_addr, info->mhz);
+    ulog("Chip key %04X, flash %06lX %s", info->chip_key, (unsigned long)info->flash_id,
+         flash_chip_name(info->flash_id));
+    unit = identify_unit(*info);
+    ulog("Unit: %s (%s)", unit.name, unit.why);
+    if (info->retries) ulog("%lu transfers retried", (unsigned long)info->retries);
+    return CONN_OK;
+}
+
 ConnectResult connect(jl::Info *info, char *err, size_t errlen) {
     usbkey::bus_float();
     if (!host::start()) {
@@ -93,16 +122,28 @@ ConnectResult connect(jl::Info *info, char *err, size_t errlen) {
         ulog("%s", err);
         return CONN_NOT_ROM;
     }
-    if (!jl::start(info, ulog, err, errlen)) {
+    return finish_connect(info, err, errlen);
+}
+
+ConnectResult connect_midi(jl::Info *info, char *err, size_t errlen) {
+    usbkey::bus_float();
+    if (!host::start()) {
+        snprintf(err, errlen, "could not start the USB host");
         ulog("%s", err);
-        return CONN_LOADER_FAILED;
+        return CONN_HOST_ERROR;
     }
-    ulog("Loader M-Flasher %s at %08lX, %u MHz", info->loader, (unsigned long)info->loader_addr, info->mhz);
-    ulog("Chip key %04X, flash ID %06lX", info->chip_key, (unsigned long)info->flash_id);
-    unit = identify_unit(*info);
-    ulog("Unit: %s (%s)", unit.name, unit.why);
-    if (info->retries) ulog("%lu transfers retried", (unsigned long)info->retries);
-    return CONN_OK;
+    uint16_t vid = 0, pid = 0;
+    if (!host::wait_or_softkey(12000, &vid, &pid, ulog, err, errlen)) {
+        ulog("%s", err);
+        return vid ? CONN_NOT_ROM : CONN_NO_DEVICE;
+    }
+    ulog("USB device %04X:%04X", vid, pid);
+    if (vid != 0x4C4A || pid != 0x8057) {
+        snprintf(err, errlen, "%04X:%04X is not the download mode", vid, pid);
+        ulog("%s", err);
+        return CONN_NOT_ROM;
+    }
+    return finish_connect(info, err, errlen);
 }
 
 bool keepalive() { return jl::ping() || host::connected(); }

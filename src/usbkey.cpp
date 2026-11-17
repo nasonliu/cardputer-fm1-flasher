@@ -90,9 +90,17 @@ static void bus_release() {
     REG_WRITE(GPIO_OUT_W1TC_REG, DP_MASK | DM_MASK);
 }
 
+void restore_usb_serial() {
+    bus_float();
+    usb_serial_jtag_ll_phy_disable_pull_override();
+    usb_serial_jtag_ll_phy_enable_pad(true);
+}
+
 void init() {
     cycles_per_us = getCpuFrequencyMhz();
-    bus_init();
+    // Do NOT detach USB-Serial/JTAG PHY at boot!
+    // Keep USB serial port alive in menus and Wi-Fi Hub so firmware updates
+    // from PC work automatically; only detach when actually flashing FM-1.
 }
 
 // One key packet, ~323 us, same waveform as Transporter's PIO program:
@@ -189,13 +197,13 @@ KeyResult send_key(KeyStats *s, uint32_t timeout_ms, bool (*poll)(const KeyStats
         }
         uint32_t now = millis();
         if (now - start > timeout_ms) {
-            bus_release();
+            restore_usb_serial();
             return TIMEOUT;
         }
         if (now - last_poll >= 100) {
             last_poll = now;
             if (poll(s)) {
-                bus_release();
+                restore_usb_serial();
                 return CANCELLED;
             }
         }
@@ -296,7 +304,7 @@ void pin_check(int *hi, int *lo) {
     gpio_set_pull_mode(PIN_DM, GPIO_PULLDOWN_ONLY);
     esp_rom_delay_us(500);
     *lo = (dp() ? 1 : 0) | (dm() ? 2 : 0);
-    bus_init();
+    restore_usb_serial();
 }
 
 static volatile uint32_t edge_count;
@@ -331,6 +339,7 @@ bool pulse_test(uint32_t *edges, double *period_us) {
     gpio_isr_handler_remove(PIN_DP);
     gpio_set_intr_type(PIN_DP, GPIO_INTR_DISABLE);
     pulses_stop();
+    restore_usb_serial();
     *edges = edge_count;
     if (*edges >= 2) *period_us = (double)(edge_last - edge_first) / (*edges - 1);
     return true;

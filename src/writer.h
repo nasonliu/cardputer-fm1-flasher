@@ -1,10 +1,9 @@
 // Installs a rescue image (m-bootloader's boot area, see rescue/README.md)
-// with M-Flasher's rules, plus a clean install: every writable sector below
-// 0xFF000 ends up exactly as the image says, the boot area written,
-// everything else erased (no firmware, no leftovers of earlier ones), so
-// m-bootloader opens its MIDI mode at the next start and waits for a firmware. Never touched: 0xFF000-0xFFFFF (key_mac, and on the
-// SMK-37 m-bootloader's copy of the calibration) and, on the SMK-37,
-// 0xC0000-0xC1FFF (Bluetooth pairing, the factory calibration).
+// or a streaming firmware source (.fwsc / .bin) with M-Flasher's safety rules:
+// - Never touched: 0xFF000-0xFFFFF (key_mac, and on SMK-37 TRIMCOPY) and, on
+//   SMK-37, 0xC0000-0xC1FFF (Bluetooth pairing, factory calibration).
+// - When flashing firmware (lo >= 0x04000), 0x00000-0x03FFF (bootloader) is
+//   also preserved and verified unchanged at the end.
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
@@ -12,6 +11,7 @@
 namespace writer {
 
 static constexpr uint32_t SECTOR = 0x1000;
+static constexpr uint32_t BOOT_AREA = 0x4000;
 static constexpr uint32_t END = 0xFF000;  // first byte never written
 static constexpr uint32_t SECTORS = END / SECTOR;
 
@@ -33,21 +33,25 @@ const Image &image(Board b);
 // The embedded boot area is intact (their CRC32s match the build's).
 bool image_ok(const Image &img, char *err, size_t errlen);
 
+struct Source {
+    const char *name;
+    uint32_t lo, hi;             // writable range [lo, hi) aligned to SECTOR, <= END
+    uint32_t keep_lo, keep_hi;   // protected range inside [lo, hi) (empty if equal)
+    bool (*read_sector)(void *ctx, uint32_t addr, uint8_t out[SECTOR], char *err, size_t errlen);
+    void *ctx;
+};
+
 struct Plan {
-    bool change[SECTORS];  // sector differs from the image (never a protected one)
-    uint32_t to_write;     // changed sectors that hold data in the image
-    uint32_t to_erase;     // changed sectors that are blank in the image
+    bool change[SECTORS];  // sector differs from the target (never a protected one)
+    uint32_t to_write;     // changed sectors that hold data
+    uint32_t to_erase;     // changed sectors that are blank (0xFF)
     uint32_t runs;
 };
 
-// Reads the unit's flash sector by sector and compares it with the image
-// (with or without a backup on the SD card).
-bool plan(const Image &img, Plan *p, Progress progress, char *err, size_t errlen);
+bool plan_source(const Source &src, Plan *p, Progress progress, char *err, size_t errlen);
+bool apply_source(const Source &src, const Plan &p, Log log, Progress progress, char *err, size_t errlen);
 
-// Notes the chip's CRC32 of every protected range, then erases, programs and
-// verifies run by run (a run that does not verify is done once more, then the
-// write stops), then checks every written range against the image and every
-// protected one against its CRC from before.
+bool plan(const Image &img, Plan *p, Progress progress, char *err, size_t errlen);
 bool apply(const Image &img, const Plan &p, Log log, Progress progress, char *err, size_t errlen);
 
 }  // namespace writer

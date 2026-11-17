@@ -21,6 +21,8 @@ struct PulseResult {
 void init();
 // Both lines GPIO, released, weak pull-down; the USB PHY detached.
 void bus_init();
+// Re-attach the ESP32-S3 USB Serial/JTAG PHY when not flashing the FM-1.
+void restore_usb_serial();
 // Both lines released with no pulls, for the USB host to take over.
 void bus_float();
 bool dp();

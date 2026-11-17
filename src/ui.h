@@ -1,7 +1,10 @@
 // Screen and keys: the log (to /fm1/log.txt and the advanced mode's console)
 // and the guided mode's pages (a picture, a few large words, the key to press).
 #pragma once
+#include <HWCDC.h>
 #include <M5Cardputer.h>
+
+extern HWCDC dbg_serial;
 
 // Not a global reference: M5Cardputer lives in another file and may not be
 // constructed yet when this file's globals are initialized.
@@ -17,11 +20,15 @@ namespace ui {
 static constexpr uint16_t CYAN = 0x065F, GREEN = 0x2F2D, ORANGE = 0xFCE3, RED = 0xF9C6, YELLOW = 0xFEA1, GREY = 0x7BEF;
 
 // --- keys
+void init_keyboard();
 bool g0_pressed();
 // '\n' ENTER or G0, 27 ESC (` or DEL), a lower-case letter or digit, or 0.
 int read_key();
 void wait_released();
 bool any_key_cancel();
+
+// --- graphical icon menu on home screen (returns 0..3: Hub, SD Flash, Rescue, Advanced)
+int home_menu(int initial_sel = 0);
 
 // --- the advanced mode's console: a title, the last log lines, a status line
 void console(const char *title, uint16_t color);

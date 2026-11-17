@@ -19,8 +19,10 @@
 
 #include "advanced.h"
 #include "engine.h"
+#include "flasher.h"
+#include "hub.h"
 #include "modes.h"
-#include "sd.h"
+#include "sdcard.h"
 #include "ui.h"
 #include "writer.h"
 
@@ -122,15 +124,30 @@ static bool connect(jl::Info *info) {
         engine::EnterResult r = engine::enter_download_mode({key_poll, answered, no_cancel}, KEY_TIMEOUT_MS, &ks);
         if (r == engine::ENTER_CANCELLED) return false;
         if (r == engine::ENTER_ALREADY_ON) {
-            Page p = {"switch_off", ui::ORANGE, "It's already on", "Switch the synth off first.", "4", "when it's off", "esc"};
-            if (ask(p, "4\x1b") != '4') return false;
+            Page p = {"switch_off", ui::ORANGE, "It's already on", "ENTER: try USB-MIDI soft-key\n4: switched off", "ENTER",
+                      "MIDI soft-key", "4:off esc"};
+            int k = ask(p, "\n4m\x1b");
+            if (k == '\n' || k == 'm') {
+                char err[96];
+                ui::page("connecting", ui::CYAN, "MIDI Soft-Key", "Sending download command over USB MIDI...", nullptr, nullptr);
+                engine::ConnectResult c = engine::connect_midi(info, err, sizeof err);
+                if (c == engine::CONN_OK) return true;
+                Page q = {"error", ui::RED, "MIDI failed", "Switch the synth off and use USB key.", "ENTER", "try again",
+                          "esc"};
+                if (ask(q, "\n4\x1b", true) == 27) finish();
+                modes::restart_into(modes::GUIDED_SWITCH_ON);
+            }
+            if (k == 27) {
+                usbkey::restore_usb_serial();
+                return false;
+            }
             continue;
         }
         if (r != engine::ENTER_OK) {
             Page p = {"error", ui::RED, "No answer",
                       ks.alive ? "Was it on before? Switch it off." : "Check the cable and that it's charged. Switch it off.",
-                      "4", "to try again", "esc"};
-            if (ask(p, "4\x1b", true) != '4') return false;
+                      "ENTER", "to try again", "esc"};
+            if (ask(p, "\n4\x1b", true) == 27) return false;
             continue;
         }
         char err[96];
@@ -138,11 +155,11 @@ static bool connect(jl::Info *info) {
         if (c == engine::CONN_OK) return true;
         // the USB host is up: a new try starts with a restart of the Cardputer
         Page p = c == engine::CONN_NOT_ROM
-                     ? Page{"error", ui::ORANGE, "It started normally", "Its own firmware is running. Switch it off.", "4",
+                     ? Page{"error", ui::ORANGE, "It started normally", "Its own firmware is running. Switch it off.", "ENTER",
                             "to try again", "esc"}
-                     : Page{"error", ui::RED, "No connection", "Switch the synth off, check the cable.", "4", "to try again",
+                     : Page{"error", ui::RED, "No connection", "Switch the synth off, check the cable.", "ENTER", "to try again",
                             "esc"};
-        if (ask(p, "4\x1b", true) != '4') finish();
+        if (ask(p, "\n4\x1b", true) == 27) finish();
         modes::restart_into(modes::GUIDED_SWITCH_ON);
     }
 }
@@ -166,16 +183,19 @@ static bool backup_or_not(const jl::Info &info) {
                 return true;
             }
             Page p = {"error", ui::RED, "Backup failed",
-                      "Nothing changed. Try another card, or take it out to skip it.", "5", "to try again",
+                      "Nothing changed. Try another card, or take it out to skip it.", "ENTER", "to try again",
                       "esc"};
-            int k = ask(p, "5\x1b", true, true);
-            if (k != '5') return false;
+            int k = ask(p, "\n5\x1b", true, true);
+            if (k == 27) {
+                usbkey::restore_usb_serial();
+                return false;
+            }
             continue;
         }
         Page p = {"warning", ui::YELLOW, "No backup card",
-                  "Without one, what is on the synth now is lost for good.", "C", "go on", "esc"};
-        int k = ask(p, "c\x1b", false, true, sd_tick);
-        if (k != 'c') return false;
+                  "Without one, what is on the synth now is lost for good.", "ENTER", "go on", "esc"};
+        int k = ask(p, "\nc\x1b", false, true, sd_tick);
+        if (k == 27) return false;
         if (sd_ready()) continue;  // a card went in meanwhile: back up after all
         ulog("No SD card: rescue without a backup.");
         return true;
@@ -183,24 +203,31 @@ static bool backup_or_not(const jl::Info &info) {
 }
 
 void run(bool switch_on) {
+    int menu_sel = 0;
     for (;;) {
         if (!switch_on) {
-            Page home = {"welcome", ui::CYAN, "Synth rescue", "An FM-1 or SMK-37 that won't start? Let's fix it.",
-                         "ENTER", "start", "A: advanced"};
-            int k = ask(home, "\na");
-            if (k == 'a') {
+            menu_sel = ui::home_menu(menu_sel);
+            if (menu_sel == 0) {
+                hub::run();
+                continue;
+            }
+            if (menu_sel == 1) {
+                flasher::run();
+                continue;
+            }
+            if (menu_sel == 3) {
                 advanced::run();
                 continue;
             }
-            Page off = {"switch_off", ui::CYAN, "Switch it off", "Turn the synth's power switch off.", "1",
+            Page off = {"switch_off", ui::CYAN, "Switch it off", "Turn the synth's power switch off.", "ENTER",
                         "when it's off", "esc"};
-            if (ask(off, "1\x1b") != '1') continue;
-            Page cable = {"connect", ui::CYAN, "Connect it", "USB-C cable from the synth to this Cardputer.", "2",
+            if (ask(off, "\n1\x1b") == 27) continue;
+            Page cable = {"connect", ui::CYAN, "Connect it", "USB-C cable from the synth to this Cardputer.", "ENTER",
                           "when connected", "esc"};
-            if (ask(cable, "2\x1b") != '2') continue;
-            Page card = {"sd_card", ui::CYAN, "Backup card", "A microSD card keeps a copy of the synth. Optional.", "3",
+            if (ask(cable, "\n2\x1b") == 27) continue;
+            Page card = {"sd_card", ui::CYAN, "Backup card", "A microSD card keeps a copy of the synth. Optional.", "ENTER",
                          "to go on", "esc"};
-            if (ask(card, "3\x1b", false, false, sd_tick) != '3') continue;
+            if (ask(card, "\n3\x1b", false, false, sd_tick) == 27) continue;
         }
         switch_on = false;
 
@@ -239,9 +266,9 @@ void run(bool switch_on) {
             ui::progress(0, 1);
             if (writer::plan(img, &plan, bar, err, sizeof err)) break;
             ulog("Reading the unit failed: %s", err);
-            Page p = {"error", ui::RED, "Can't read it", "Nothing was changed. Keep it on and plugged in.", "6",
+            Page p = {"error", ui::RED, "Can't read it", "Nothing was changed. Keep it on and plugged in.", "ENTER",
                       "to try again", "esc"};
-            if (ask(p, "6\x1b", true, true) != '6') leave(true);
+            if (ask(p, "\n6\x1b", true, true) == 27) leave(true);
         }
         char done_text[96];
         if (!plan.to_write && !plan.to_erase) {
@@ -254,8 +281,8 @@ void run(bool switch_on) {
 
         char body[96];
         snprintf(body, sizeof body, "The %s gets a fresh bootloader; its old firmware and settings are erased.", unit.name);
-        Page confirm = {art, ui::ORANGE, "Ready to repair", body, "Y", "repair now", "esc"};
-        if (ask(confirm, "y\x1b", false, true) != 'y') leave(true);
+        Page confirm = {art, ui::ORANGE, "Ready to repair", body, "ENTER", "repair now", "esc"};
+        if (ask(confirm, "\ny\x1b", false, true) == 27) leave(true);
 
         for (;;) {
             ui::page("repair", ui::ORANGE, "Repairing", "Don't switch it off or unplug it.", nullptr, nullptr);

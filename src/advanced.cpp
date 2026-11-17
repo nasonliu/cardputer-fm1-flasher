@@ -3,8 +3,10 @@
 #include "advanced.h"
 
 #include "engine.h"
+#include "flasher.h"
+#include "hub.h"
 #include "modes.h"
-#include "sd.h"
+#include "sdcard.h"
 #include "uboot_host.h"
 #include "ui.h"
 #include "writer.h"
@@ -15,18 +17,42 @@ namespace advanced {
 
 static constexpr uint32_t KEY_TIMEOUT_MS = 60000;
 
-static void idle_screen() {
-    ui::clear_log();
-    ui::console("Advanced", TFT_CYAN);
-    ulog("FM-1/SMK-37 OFF, connect to the USB-C.");
-    ulog("Run on battery: no PC/charger attached.");
-    ulog("ENTER/G0  connect (backup, rescue)");
-    ulog("H         key only, then move to a PC");
-    ulog("P / T     pin check / pulse test");
-    ulog("          (nothing plugged in)");
-    ulog("ESC       back to the guided mode");
-    ulog("Synth rescue %s", APP_VERSION);
-    ui::status(sd_ok ? "SD card ready" : "No SD card: backups need one");
+static constexpr int ADV_ITEMS = 8;
+static const char *const ADV_LABELS[ADV_ITEMS] = {
+    "Connect (unit OFF -> USB key)",
+    "Connect via USB-MIDI (unit ON)",
+    "Flash .fwsc / .bin from SD",
+    "Wi-Fi Firmware Hub",
+    "Key only -> move cable to PC",
+    "Pin check (unplugged)",
+    "Pulse test (unplugged)",
+    "Back to Home menu",
+};
+
+static void draw_adv_menu(int sel) {
+    lcd.startWrite();
+    lcd.fillScreen(TFT_BLACK);
+    lcd.setFont(&fonts::Font0);
+    lcd.setTextSize(2);
+    lcd.setTextColor(TFT_CYAN, TFT_BLACK);
+    lcd.setCursor(4, 2);
+    lcd.printf("Advanced %s", APP_VERSION);
+    lcd.setTextSize(1);
+    for (int i = 0; i < ADV_ITEMS; i++) {
+        int y = 23 + i * 12;
+        if (i == sel) {
+            lcd.fillRect(0, y - 1, 240, 11, 0x0210);
+            lcd.setTextColor(TFT_WHITE, 0x0210);
+        } else {
+            lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+        }
+        lcd.setCursor(4, y);
+        lcd.printf("%c %s", i == sel ? '>' : ' ', ADV_LABELS[i]);
+    }
+    lcd.setTextColor(TFT_YELLOW, TFT_BLACK);
+    lcd.setCursor(4, 124);
+    lcd.print(";/ . move   ENTER select   ESC back");
+    lcd.endWrite();
 }
 
 static uint32_t key_start_ms;
@@ -263,6 +289,26 @@ static void run_session() {
     }
     ui::console("Connected", TFT_GREEN);
     ulog("Unit: %s (%s)", unit.name, unit.why);
+    ulog("Flash: %06lX %s", (unsigned long)info.flash_id, engine::flash_chip_name(info.flash_id));
+    connected_menu(info);
+}
+
+static void run_midi_session() {
+    ui::clear_log();
+    ui::console("MIDI Soft-Key", TFT_YELLOW);
+    ulog("Connect powered-on unit via USB-C.");
+    ui::status("Sending MIDI soft key...");
+    jl::Info info;
+    char err[96];
+    engine::ConnectResult c = engine::connect_midi(&info, err, sizeof err);
+    if (c != engine::CONN_OK) {
+        ui::console(c == engine::CONN_LOADER_FAILED ? "Loader failed" : "MIDI failed", TFT_RED);
+        ulog("%s", err);
+        return;
+    }
+    ui::console("Connected", TFT_GREEN);
+    ulog("Unit: %s (%s)", unit.name, unit.why);
+    ulog("Flash: %06lX %s", (unsigned long)info.flash_id, engine::flash_chip_name(info.flash_id));
     connected_menu(info);
 }
 
@@ -274,24 +320,64 @@ static void end_session() {
 }
 
 void run() {
-    idle_screen();
+    int sel = 0;
+    draw_adv_menu(sel);
+    ui::wait_released();
     for (;;) {
-        // no card at power-on: look again now and then on the idle screen
         static uint32_t last_sd_try;
         if (!sd_ok && millis() - last_sd_try > 3000) {
             last_sd_try = millis();
-            if (sd_mount()) ui::status("SD card ready");
+            sd_mount();
         }
         int k = ui::read_key();
-        if (k == '\n') {
+        if (!k) {
+            delay(15);
+            continue;
+        }
+        if (k == ';' || k == ',' || k == 'k') {
+            sel = (sel + ADV_ITEMS - 1) % ADV_ITEMS;
+            draw_adv_menu(sel);
+            continue;
+        }
+        if (k == '.' || k == '/' || k == 'j') {
+            sel = (sel + 1) % ADV_ITEMS;
+            draw_adv_menu(sel);
+            continue;
+        }
+        if (k == 27) {
+            ui::wait_released();
+            return;
+        }
+        int act = -1;
+        if (k == '\n') act = sel;
+        else if (k == 'm') act = 1;
+        else if (k == 'f') act = 2;
+        else if (k == 'w') act = 3;
+        else if (k == 'h') act = 4;
+        else if (k == 'p') act = 5;
+        else if (k == 't') act = 6;
+
+        if (act == 0) {
             ui::wait_released();
             run_session();
             end_session();
-        } else if (k == 'h') {
+        } else if (act == 1) {
+            ui::wait_released();
+            run_midi_session();
+            end_session();
+        } else if (act == 2) {
+            ui::wait_released();
+            flasher::run();
+            draw_adv_menu(sel);
+        } else if (act == 3) {
+            ui::wait_released();
+            hub::run();
+            draw_adv_menu(sel);
+        } else if (act == 4) {
             ui::wait_released();
             run_handoff();
             end_session();
-        } else if (k == 'p') {
+        } else if (act == 5) {
             int hi, lo;
             usbkey::pin_check(&hi, &lo);
             bool ok = hi == 3 && lo == 0;
@@ -301,8 +387,8 @@ void run() {
             ulog("Run with nothing plugged into USB-C.");
             ui::status("Any key: back");
             while (!ui::read_key()) delay(20);
-            idle_screen();
-        } else if (k == 't') {
+            draw_adv_menu(sel);
+        } else if (act == 6) {
             ui::clear_log();
             ui::console("Pulse test", TFT_YELLOW);
             ulog("Measuring for 3 s, nothing plugged in.");
@@ -320,12 +406,11 @@ void run() {
             }
             ui::status("Any key: back");
             while (!ui::read_key()) delay(20);
-            idle_screen();
-        } else if (k == 27) {
+            draw_adv_menu(sel);
+        } else if (act == 7) {
             ui::wait_released();
             return;
         }
-        delay(10);
     }
 }
 

@@ -10,17 +10,28 @@
 // log on screen, each step under control, self-tests, hand-off to a PC).
 
 #include <M5Cardputer.h>
+#include <nvs_flash.h>
 
 #include "advanced.h"
 #include "guided.h"
 #include "modes.h"
-#include "sd.h"
+#include "sdcard.h"
 #include "ui.h"
 #include "usbkey.h"
 
+// Give loopTask 32 KB stack for WiFi + mbedTLS (WiFiClientSecure) + HTTPClient
+SET_LOOP_TASK_STACK_SIZE(32 * 1024);
+
 void setup() {
+    dbg_serial.begin();
+    esp_err_t nvs_err = nvs_flash_init();
+    if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES || nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        nvs_flash_init();
+    }
     auto cfg = M5.config();
     M5Cardputer.begin(cfg, true);
+    ui::init_keyboard();
     // Landscape. Newer M5GFX already rotates the ADV panel (rotation_offset 1),
     // so rotation 0 is landscape there; older versions need 1 (as in M5's examples).
     lcd.setRotation(0);

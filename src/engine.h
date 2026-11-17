@@ -25,6 +25,11 @@ EnterResult enter_download_mode(const EnterHooks &h, uint32_t timeout_ms, usbkey
 // --- the USB host and the loader
 enum ConnectResult { CONN_OK, CONN_HOST_ERROR, CONN_NO_DEVICE, CONN_NOT_ROM, CONN_LOADER_FAILED };
 ConnectResult connect(jl::Info *info, char *err, size_t errlen);
+// Connects to an already-powered-on unit via USB-MIDI soft key (or UBOOT directly).
+ConnectResult connect_midi(jl::Info *info, char *err, size_t errlen);
+
+const char *flash_chip_name(uint32_t flash_id);
+inline bool is_new_fm1_flash(uint32_t flash_id) { return flash_id == 0xB36014; }
 
 // --- which unit: decided before anything can be written
 enum Model { MODEL_UNKNOWN, MODEL_FM1, MODEL_SMK37 };

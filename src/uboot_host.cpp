@@ -126,7 +126,10 @@ static bool enum_filter(const usb_device_desc_t *, uint8_t *bConfigurationValue)
     return true;
 }
 
+static bool host_started;
+
 bool start() {
+    if (host_started) return true;
     esp_log_set_vprintf(idf_vprintf);
     // ESP-IDF's errors, plus the USB host's own steps where the build has them
     esp_log_level_set("*", ESP_LOG_ERROR);
@@ -148,9 +151,11 @@ bool start() {
     xTaskCreatePinnedToCore(client_task, "usb_client", 4096, nullptr, 5, nullptr, 0);
 
     done = xSemaphoreCreateBinary();
-    return usb_host_transfer_alloc(OUT_SIZE, 0, &x_out) == ESP_OK &&
-           usb_host_transfer_alloc(IN_SIZE, 0, &x_in) == ESP_OK &&
-           usb_host_transfer_alloc(64, 0, &x_ctl) == ESP_OK;
+    bool ok = usb_host_transfer_alloc(OUT_SIZE, 0, &x_out) == ESP_OK &&
+              usb_host_transfer_alloc(IN_SIZE, 0, &x_in) == ESP_OK &&
+              usb_host_transfer_alloc(64, 0, &x_ctl) == ESP_OK;
+    if (ok) host_started = true;
+    return ok;
 }
 
 bool connected() { return dev && !gone; }
@@ -182,6 +187,30 @@ static bool find_bulk(const usb_config_desc_t *cd) {
     ep_out = out;
     mps_in = mps ? mps : 64;
     return true;
+}
+
+// Finds the first USB-MIDI Streaming interface (class 0x01, subclass 0x03)
+// with a Bulk OUT endpoint.
+static bool find_midi_out(const usb_config_desc_t *cd, uint8_t *midi_if, uint8_t *midi_ep_out) {
+    const uint8_t *p = (const uint8_t *)cd;
+    int total = cd->wTotalLength;
+    int cur_if = -1;
+    bool is_midi = false;
+    for (int i = 0; i + 1 < total && p[i] >= 2; i += p[i]) {
+        if (p[i + 1] == 0x04 && p[i] >= 9) {  // interface descriptor
+            cur_if = p[i + 2];
+            is_midi = (p[i + 5] == 0x01 && p[i + 6] == 0x03);
+        } else if (p[i + 1] == 0x05 && p[i] >= 7 && is_midi && cur_if >= 0) {
+            uint8_t ep = p[i + 2];
+            uint8_t attr = p[i + 3];
+            if ((attr & 3) == 2 && !(ep & 0x80)) {  // Bulk OUT
+                *midi_if = (uint8_t)cur_if;
+                *midi_ep_out = ep;
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 bool wait_device(uint32_t timeout_ms, uint16_t *vid, uint16_t *pid, Log log, char *err, size_t errlen) {
@@ -418,6 +447,74 @@ Result execute(const uint8_t *cdb, uint8_t cdb_len, uint8_t *buf, uint32_t len, 
     // a refused command leaves the transport in order; a failed one is reset
     if (r == FAILED && connected()) reset_recovery();
     return r;
+}
+
+bool wait_or_softkey(uint32_t timeout_ms, uint16_t *vid, uint16_t *pid, Log log, char *err, size_t errlen) {
+    TickType_t t0 = xTaskGetTickCount();
+    log_phy(log);
+    while (new_addr < 0) {
+        drain_idf_log(log);
+        if (xTaskGetTickCount() - t0 > pdMS_TO_TICKS(timeout_ms)) {
+            snprintf(err, errlen, "no USB device in %lu ms", (unsigned long)timeout_ms);
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    drain_idf_log(log);
+    trace = log;
+    if (usb_host_device_open(client, (uint8_t)new_addr, &dev) != ESP_OK) {
+        snprintf(err, errlen, "could not open the USB device");
+        return false;
+    }
+    const usb_device_desc_t *dd;
+    usb_host_get_device_descriptor(dev, &dd);
+    *vid = dd->idVendor;
+    *pid = dd->idProduct;
+    const usb_config_desc_t *cd;
+    if (usb_host_get_active_config_descriptor(dev, &cd) != ESP_OK) {
+        snprintf(err, errlen, "no config descriptor for %04X:%04X", *vid, *pid);
+        return false;
+    }
+
+    if (*vid != 0x4C4A || *pid != 0x8057) {
+        uint8_t midi_if = 0, midi_ep = 0;
+        if (!find_midi_out(cd, &midi_if, &midi_ep)) {
+            snprintf(err, errlen, "%04X:%04X is not UBOOT or USB-MIDI", *vid, *pid);
+            return false;
+        }
+        if (usb_host_interface_claim(client, dev, midi_if, 0) != ESP_OK) {
+            snprintf(err, errlen, "could not claim MIDI interface %u", midi_if);
+            return false;
+        }
+        // USB-MIDI SysEx soft key: F0 22 24 35 7D F7
+        static const uint8_t softkey[8] = {0x04, 0xF0, 0x22, 0x24, 0x07, 0x35, 0x7D, 0xF7};
+        memcpy(x_out->data_buffer, softkey, sizeof(softkey));
+        log("Sending USB-MIDI soft key to %04X:%04X...", *vid, *pid);
+        usb_transfer_status_t st = run(x_out, midi_ep, sizeof(softkey));
+        usb_host_interface_release(client, dev, midi_if);
+        usb_host_device_close(client, dev);
+        dev = nullptr;
+        new_addr = -1;
+        gone = false;
+        if (st != USB_TRANSFER_STATUS_COMPLETED) {
+            snprintf(err, errlen, "USB-MIDI soft key send failed (%d)", (int)st);
+            return false;
+        }
+        log("Soft key sent; waiting for WL82 UBOOT...");
+        return wait_device(timeout_ms, vid, pid, log, err, errlen);
+    }
+
+    usb_device_info_t di;
+    if (usb_host_device_info(dev, &di) == ESP_OK) dev_addr = di.dev_addr;
+    if (!find_bulk(cd)) {
+        snprintf(err, errlen, "%04X:%04X has no bulk interface", *vid, *pid);
+        return false;
+    }
+    if (usb_host_interface_claim(client, dev, iface, 0) != ESP_OK) {
+        snprintf(err, errlen, "could not claim interface %u", iface);
+        return false;
+    }
+    return true;
 }
 
 }  // namespace host

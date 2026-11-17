@@ -1,4 +1,4 @@
-#include "sd.h"
+#include "sdcard.h"
 
 #include <SPI.h>
 
@@ -12,7 +12,10 @@ bool sd_mount() {
     }
     SD.end();
     sd_ok = SD.begin(12, SPI, 20000000);
-    if (sd_ok) SD.mkdir("/fm1");
+    if (sd_ok) {
+        SD.mkdir("/fm1");
+        SD.mkdir("/fm1/firmware");
+    }
     return sd_ok;
 }
 

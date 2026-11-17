@@ -11,10 +11,9 @@ extern "C" const uint8_t rescue_smk37_boot[], rescue_smk37_boot_end[];
 
 namespace writer {
 
-static constexpr uint32_t BOOT_AREA = 0x4000;
 static constexpr uint32_t FLASH_SIZE = 0x100000;
-static uint8_t blank[SECTOR];
 static uint8_t sector_buf[SECTOR];
+static uint8_t target_buf[SECTOR];
 
 const Image &image(Board b) {
     static const Image fm1 = {
@@ -28,29 +27,27 @@ const Image &image(Board b) {
     return b == SMK37 ? smk37 : fm1;
 }
 
-static bool is_protected(const Image &img, uint32_t s) {
-    uint32_t a = s * SECTOR;
-    return a >= END || (a >= img.keep_lo && a < img.keep_hi);
-}
-
-// The image's bytes for sector s: the boot area, then erased flash.
-static const uint8_t *target(const Image &img, uint32_t s) {
-    uint32_t a = s * SECTOR;
-    if (a < BOOT_AREA) return img.boot + a;
-    if (!blank[0]) memset(blank, 0xFF, sizeof blank);
-    return blank;
-}
-
 static bool is_blank(const uint8_t *d) {
     for (uint32_t i = 0; i < SECTOR; i++)
         if (d[i] != 0xFF) return false;
     return true;
 }
 
-static uint32_t target_crc(const Image &img, uint32_t first, uint32_t count) {
-    uint32_t crc = 0;
-    for (uint32_t s = first; s < first + count; s++) crc = jl::crc32_update(crc, target(img, s), SECTOR);
-    return crc;
+static bool is_writable(const Source &src, uint32_t s) {
+    uint32_t a = s * SECTOR;
+    if (a < src.lo || a >= src.hi || a >= END) return false;
+    if (src.keep_hi > src.keep_lo && a >= src.keep_lo && a < src.keep_hi) return false;
+    return true;
+}
+
+static bool source_crc(const Source &src, uint32_t lo, uint32_t hi, uint32_t *crc, char *err, size_t errlen) {
+    uint32_t c = 0;
+    for (uint32_t a = lo; a < hi; a += SECTOR) {
+        if (!src.read_sector(src.ctx, a, target_buf, err, errlen)) return false;
+        c = jl::crc32_update(c, target_buf, SECTOR);
+    }
+    *crc = c;
+    return true;
 }
 
 bool image_ok(const Image &img, char *err, size_t errlen) {
@@ -65,37 +62,41 @@ bool image_ok(const Image &img, char *err, size_t errlen) {
     return true;
 }
 
-bool plan(const Image &img, Plan *p, Progress progress, char *err, size_t errlen) {
+bool plan_source(const Source &src, Plan *p, Progress progress, char *err, size_t errlen) {
     memset(p, 0, sizeof *p);
     bool prev = false;
     for (uint32_t s = 0; s < SECTORS; s++) {
         bool change = false;
-        if (!is_protected(img, s)) {
-            if (!jl::read(s * SECTOR, sector_buf, SECTOR, err, errlen)) return false;
-            change = memcmp(sector_buf, target(img, s), SECTOR) != 0;
+        if (is_writable(src, s)) {
+            uint32_t a = s * SECTOR;
+            if (!src.read_sector(src.ctx, a, target_buf, err, errlen)) return false;
+            if (!jl::read(a, sector_buf, SECTOR, err, errlen)) return false;
+            change = memcmp(sector_buf, target_buf, SECTOR) != 0;
         }
         p->change[s] = change;
         if (change) {
-            if (is_blank(target(img, s))) p->to_erase++;
+            if (is_blank(target_buf)) p->to_erase++;
             else p->to_write++;
             if (!prev) p->runs++;
         }
         prev = change;
-        if (s % 16 == 15) progress(s + 1, SECTORS);
+        if (progress && (s % 16 == 15)) progress(s + 1, SECTORS);
     }
+    if (progress) progress(SECTORS, SECTORS);
     return true;
 }
 
 // One run of changed sectors: erase, program, verify with the chip's CRC32.
-static bool do_run(const Image &img, uint32_t first, uint32_t count, char *err, size_t errlen) {
+static bool do_run(const Source &src, uint32_t first, uint32_t count, char *err, size_t errlen) {
     if (!jl::erase(first * SECTOR, count * SECTOR, err, errlen)) return false;
+    uint32_t want = 0;
     for (uint32_t s = first; s < first + count; s++) {
-        const uint8_t *t = target(img, s);
-        if (!is_blank(t) && !jl::program(s * SECTOR, t, SECTOR, err, errlen)) return false;
+        if (!src.read_sector(src.ctx, s * SECTOR, target_buf, err, errlen)) return false;
+        want = jl::crc32_update(want, target_buf, SECTOR);
+        if (!is_blank(target_buf) && !jl::program(s * SECTOR, target_buf, SECTOR, err, errlen)) return false;
     }
     uint32_t chip;
     if (!jl::crc32(first * SECTOR, count * SECTOR, &chip, err, errlen)) return false;
-    uint32_t want = target_crc(img, first, count);
     if (chip != want) {
         snprintf(err, errlen, "0x%05lX-0x%05lX reads back CRC %08lX, not %08lX", (unsigned long)(first * SECTOR),
                  (unsigned long)((first + count) * SECTOR - 1), (unsigned long)chip, (unsigned long)want);
@@ -104,28 +105,33 @@ static bool do_run(const Image &img, uint32_t first, uint32_t count, char *err, 
     return true;
 }
 
-// [lo, hi) on the chip against the image.
-static bool check_written(const Image &img, uint32_t lo, uint32_t hi, char *err, size_t errlen) {
-    uint32_t chip;
+// [lo, hi) on the chip against the source.
+static bool check_written(const Source &src, uint32_t lo, uint32_t hi, char *err, size_t errlen) {
+    if (hi <= lo) return true;
+    uint32_t chip = 0, want = 0;
     if (!jl::crc32(lo, hi - lo, &chip, err, errlen)) return false;
-    if (chip != target_crc(img, lo / SECTOR, (hi - lo) / SECTOR)) {
-        snprintf(err, errlen, "final check: 0x%05lX-0x%05lX does not match the image", (unsigned long)lo,
+    if (!source_crc(src, lo, hi, &want, err, errlen)) return false;
+    if (chip != want) {
+        snprintf(err, errlen, "final check: 0x%05lX-0x%05lX does not match", (unsigned long)lo,
                  (unsigned long)(hi - 1));
         return false;
     }
     return true;
 }
 
-bool apply(const Image &img, const Plan &p, Log log, Progress progress, char *err, size_t errlen) {
-    // the protected ranges as they are now: they must read the same afterwards
-    bool keep = img.keep_hi > img.keep_lo;
-    uint32_t kept_crc = 0, top_crc = 0;
-    if ((keep && !jl::crc32(img.keep_lo, img.keep_hi - img.keep_lo, &kept_crc, err, errlen)) ||
-        !jl::crc32(END, FLASH_SIZE - END, &top_crc, err, errlen))
+bool apply_source(const Source &src, const Plan &p, Log log, Progress progress, char *err, size_t errlen) {
+    // Snapshot CRCs of all protected ranges before writing.
+    bool keep = src.keep_hi > src.keep_lo && src.keep_lo < src.hi && src.keep_hi > src.lo;
+    bool keep_boot = src.lo >= BOOT_AREA;
+    uint32_t kept_crc = 0, top_crc = 0, boot_crc = 0;
+    if ((keep && !jl::crc32(src.keep_lo, src.keep_hi - src.keep_lo, &kept_crc, err, errlen)) ||
+        (keep_boot && !jl::crc32(0, BOOT_AREA, &boot_crc, err, errlen)) ||
+        !jl::crc32(END, FLASH_SIZE - END, &top_crc, err, errlen)) {
         return false;
+    }
 
     uint32_t total = p.to_write + p.to_erase, done = 0;
-    progress(0, total);
+    if (progress) progress(0, total);
     for (uint32_t s = 0; s < SECTORS;) {
         if (!p.change[s]) {
             s++;
@@ -134,28 +140,40 @@ bool apply(const Image &img, const Plan &p, Log log, Progress progress, char *er
         uint32_t first = s;
         while (s < SECTORS && p.change[s]) s++;
         uint32_t count = s - first;
-        log("0x%05lX-0x%05lX: %lu sector%s", (unsigned long)(first * SECTOR), (unsigned long)(s * SECTOR - 1),
-            (unsigned long)count, count == 1 ? "" : "s");
-        if (!do_run(img, first, count, err, errlen)) {
-            log("Not verified (%s): once more", err);
-            if (!do_run(img, first, count, err, errlen)) return false;
+        if (log) {
+            log("0x%05lX-0x%05lX: %lu sector%s", (unsigned long)(first * SECTOR), (unsigned long)(s * SECTOR - 1),
+                (unsigned long)count, count == 1 ? "" : "s");
+        }
+        if (!do_run(src, first, count, err, errlen)) {
+            if (log) log("Not verified (%s): once more", err);
+            if (!do_run(src, first, count, err, errlen)) return false;
         }
         done += count;
-        progress(done, total);
+        if (progress) progress(done, total);
     }
 
     if (keep) {
-        if (!check_written(img, 0, img.keep_lo, err, errlen) || !check_written(img, img.keep_hi, END, err, errlen))
+        if (!check_written(src, src.lo, src.keep_lo, err, errlen) ||
+            !check_written(src, src.keep_hi, src.hi, err, errlen)) {
             return false;
-    } else if (!check_written(img, 0, END, err, errlen)) {
+        }
+    } else if (!check_written(src, src.lo, src.hi, err, errlen)) {
         return false;
     }
+
     uint32_t crc;
+    if (keep_boot) {
+        if (!jl::crc32(0, BOOT_AREA, &crc, err, errlen)) return false;
+        if (crc != boot_crc) {
+            snprintf(err, errlen, "final check: bootloader 0x00000-0x03FFF changed");
+            return false;
+        }
+    }
     if (keep) {
-        if (!jl::crc32(img.keep_lo, img.keep_hi - img.keep_lo, &crc, err, errlen)) return false;
+        if (!jl::crc32(src.keep_lo, src.keep_hi - src.keep_lo, &crc, err, errlen)) return false;
         if (crc != kept_crc) {
-            snprintf(err, errlen, "final check: protected 0x%05lX-0x%05lX changed", (unsigned long)img.keep_lo,
-                     (unsigned long)(img.keep_hi - 1));
+            snprintf(err, errlen, "final check: protected 0x%05lX-0x%05lX changed", (unsigned long)src.keep_lo,
+                     (unsigned long)(src.keep_hi - 1));
             return false;
         }
     }
@@ -164,12 +182,33 @@ bool apply(const Image &img, const Plan &p, Log log, Progress progress, char *er
         snprintf(err, errlen, "final check: protected 0x%05lX- changed", (unsigned long)END);
         return false;
     }
-    if (keep)
-        log("Verified: as the image, 0x%05lX-0x%05lX and 0x%05lX- unchanged", (unsigned long)img.keep_lo,
-            (unsigned long)(img.keep_hi - 1), (unsigned long)END);
-    else
-        log("Verified: 0x00000-0x%05lX as the image, 0x%05lX- unchanged", (unsigned long)(END - 1), (unsigned long)END);
+    if (log) {
+        log("Verified: 0x%05lX-0x%05lX written, protected areas unchanged",
+            (unsigned long)src.lo, (unsigned long)(src.hi - 1));
+    }
     return true;
+}
+
+static bool rescue_read_sector(void *ctx, uint32_t addr, uint8_t out[SECTOR], char *, size_t) {
+    const Image *img = (const Image *)ctx;
+    if (addr < BOOT_AREA) {
+        memcpy(out, img->boot + addr, SECTOR);
+    } else {
+        memset(out, 0xFF, SECTOR);
+    }
+    return true;
+}
+
+static Source rescue_source(const Image &img) {
+    return {img.name, 0, END, img.keep_lo, img.keep_hi, rescue_read_sector, (void *)&img};
+}
+
+bool plan(const Image &img, Plan *p, Progress progress, char *err, size_t errlen) {
+    return plan_source(rescue_source(img), p, progress, err, errlen);
+}
+
+bool apply(const Image &img, const Plan &p, Log log, Progress progress, char *err, size_t errlen) {
+    return apply_source(rescue_source(img), p, log, progress, err, errlen);
 }
 
 }  // namespace writer

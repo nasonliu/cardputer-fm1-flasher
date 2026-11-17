@@ -16,6 +16,11 @@ typedef void (*Log)(const char *fmt, ...);
 // Waits for a device to enumerate; fills vid/pid. Claims its bulk interface.
 // Logs the root port's state as it changes, and ESP-IDF's own USB messages.
 bool wait_device(uint32_t timeout_ms, uint16_t *vid, uint16_t *pid, Log log, char *err, size_t errlen);
+
+// Sends the USB-MIDI SysEx soft key (F0 22 24 35 7D F7) to an already-running
+// FM-1/SMK-37, waits for it to reboot into 4C4A:8057 (WL82 UBOOT1.00), and
+// claims its bulk interface. If 4C4A:8057 is already connected, claims it directly.
+bool wait_or_softkey(uint32_t timeout_ms, uint16_t *vid, uint16_t *pid, Log log, char *err, size_t errlen);
 bool connected();
 
 // One Bulk-Only Transport command. in: data from the device into buf.
