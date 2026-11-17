@@ -6,9 +6,6 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <ctype.h>
-#include <esp_netif.h>
-#include <lwip/dns.h>
-#include <lwip/netif.h>
 #include <mbedtls/sha256.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,20 +22,22 @@ static constexpr const char *HUB_HOST = "https://thefirmwarehub.com";
 static constexpr const char *CATALOG_URL = "https://thefirmwarehub.com/catalog.json";
 static constexpr const char *INDEX_PATH = "/fm1/hub_index.dat";
 static constexpr const char *WIFI_PATH = "/fm1/wifi.txt";
-static constexpr uint32_t INDEX_MAGIC = 0x48554231;  // "HUB1"
+static constexpr uint32_t INDEX_MAGIC = 0x48554232;  // "HUB2"
 static constexpr int MAX_ENTRIES = 256;
-static constexpr int MAX_RAM_ENTRIES = 80;
+static constexpr int MAX_RAM_ENTRIES = 60;
 
 enum ChipCompat : uint8_t { CHIP_OLD = 0, CHIP_NEW = 1, CHIP_ANY = 2 };
 
 struct __attribute__((packed)) HubEntry {
     char name[32];
-    char author[40];
-    char version[28];
-    char pkg[96];
+    char author[36];
+    char version[24];
+    char pkg[88];
     char sha256[65];
-    char kind[20];
+    char kind[16];
+    char what[220];
     uint32_t size;
+    uint16_t stars;
     uint8_t chip;
 };
 
@@ -47,14 +46,38 @@ struct IndexHeader {
     uint32_t count;
 };
 
+enum CatId : uint8_t {
+    CAT_ALL = 0,
+    CAT_SYNTH = 1,
+    CAT_GROOVE = 2,
+    CAT_DRUMS = 3,
+    CAT_TRACKER = 4,
+    CAT_OTHER = 5,
+    CAT_COUNT = 6,
+};
+
+static const char *const CAT_NAMES[CAT_COUNT] = {"All", "Synth", "Groove", "Drums", "Tracker", "Chords+"};
+static const char *const CAT_SUBS[CAT_COUNT] = {
+    "Every compatible firmware",
+    "Leads, FM, poly & wavetable",
+    "Sequencers & grooveboxes",
+    "Drum machines & samplers",
+    "Pattern & hex trackers",
+    "Chord engines, MIDI & tools",
+};
+static const uint16_t CAT_COLORS[CAT_COUNT] = {
+    ui::CYAN, 0x3E7F, ui::GREEN, ui::ORANGE, 0xF81F, ui::YELLOW,
+};
+
 // In-memory catalog cache (used ONLY when no SD card is inserted)
 static HubEntry *ram_entries = nullptr;
 static int ram_count = 0;
 
-// Filtered view indices
+// Filtered view indices for the active category
 static uint16_t view_idx[MAX_ENTRIES];
 static int total_entries = 0;
 static int view_count = 0;
+static int cat_counts[CAT_COUNT];
 static bool filter_new_only = true;
 static char search_q[24] = "";
 
@@ -405,7 +428,8 @@ static bool ensure_wifi() {
     return wifi_setup_ui();
 }
 
-// Extracts `"key": "val"` or `"key": 1234` from a single line of pretty-printed catalog.json.
+// Extracts `"key": "val"` from a single line of pretty-printed catalog.json,
+// cleaning simple JSON escapes (\u2014 -> '-', etc.) for Font0 ASCII display.
 static bool parse_json_str(const char *line, const char *key, char *out, size_t maxlen) {
     char pat[32];
     snprintf(pat, sizeof(pat), "\"%s\": \"", key);
@@ -414,8 +438,23 @@ static bool parse_json_str(const char *line, const char *key, char *out, size_t 
     p += strlen(pat);
     size_t i = 0;
     while (*p && *p != '"' && i + 1 < maxlen) {
-        if (*p == '\\' && p[1]) p++;
-        out[i++] = *p++;
+        if (*p == '\\' && p[1]) {
+            p++;
+            if (*p == 'u' && p[1] && p[2] && p[3] && p[4]) {
+                char hex[5] = {p[1], p[2], p[3], p[4], 0};
+                unsigned long cp = strtoul(hex, nullptr, 16);
+                p += 5;
+                if (cp == 0x2013 || cp == 0x2014) out[i++] = '-';
+                else if (cp == 0x2018 || cp == 0x2019) out[i++] = '\'';
+                else if (cp == 0x201C || cp == 0x201D) out[i++] = '"';
+                else if (cp == 0x00FC || cp == 0x00FB) out[i++] = 'u';
+                else if (cp == 0x00E9 || cp == 0x00E8) out[i++] = 'e';
+                else if (cp >= 32 && cp < 127) out[i++] = (char)cp;
+                continue;
+            }
+        }
+        unsigned char c = (unsigned char)*p++;
+        out[i++] = (c >= 32 && c < 127) ? (char)c : ' ';
     }
     out[i] = 0;
     return true;
@@ -430,6 +469,14 @@ static bool parse_json_u32(const char *line, const char *key, uint32_t *out) {
     if (!isdigit((unsigned char)*p)) return false;
     *out = (uint32_t)strtoul(p, nullptr, 10);
     return true;
+}
+
+static CatId kind_to_cat(const char *kind) {
+    if (strcasecmp(kind, "synth") == 0) return CAT_SYNTH;
+    if (strcasecmp(kind, "groove") == 0) return CAT_GROOVE;
+    if (strcasecmp(kind, "drums") == 0) return CAT_DRUMS;
+    if (strcasecmp(kind, "tracker") == 0) return CAT_TRACKER;
+    return CAT_OTHER;  // chords, other, dev
 }
 
 static bool fetch_catalog() {
@@ -494,6 +541,7 @@ static bool fetch_catalog() {
     bool in_firmwares = false;
     bool done_firmwares = false;
     bool in_entry = false;
+    bool in_kind_arr = false;
     HubEntry cur{};
     char line[1024];
     uint8_t net_buf[1024];
@@ -513,6 +561,7 @@ static bool fetch_catalog() {
         if (strcmp(ln, "  {") == 0) {
             memset(&cur, 0, sizeof(cur));
             in_entry = true;
+            in_kind_arr = false;
             return;
         }
         if (strcmp(ln, "  },") == 0 || strcmp(ln, "  }") == 0) {
@@ -525,17 +574,43 @@ static bool fetch_catalog() {
                 }
             }
             in_entry = false;
+            in_kind_arr = false;
             return;
         }
-        if (in_entry && strncmp(ln, "   \"", 4) == 0) {
+        if (!in_entry) return;
+        if (in_kind_arr) {
+            if (strncmp(ln, "   ]", 4) == 0) {
+                in_kind_arr = false;
+            } else if (!cur.kind[0]) {
+                const char *q1 = strchr(ln, '"');
+                if (q1) {
+                    q1++;
+                    const char *q2 = strchr(q1, '"');
+                    if (q2 && q2 > q1) {
+                        size_t len = (size_t)(q2 - q1);
+                        if (len >= sizeof(cur.kind)) len = sizeof(cur.kind) - 1;
+                        memcpy(cur.kind, q1, len);
+                        cur.kind[len] = 0;
+                    }
+                }
+            }
+            return;
+        }
+        if (strncmp(ln, "   \"kind\": [", 12) == 0) {
+            in_kind_arr = true;
+            return;
+        }
+        if (strncmp(ln, "   \"", 4) == 0) {
             parse_json_str(ln, "name", cur.name, sizeof(cur.name));
             parse_json_str(ln, "author", cur.author, sizeof(cur.author));
             parse_json_str(ln, "version", cur.version, sizeof(cur.version));
             parse_json_str(ln, "pkg", cur.pkg, sizeof(cur.pkg));
             parse_json_str(ln, "sha256", cur.sha256, sizeof(cur.sha256));
             parse_json_str(ln, "kind", cur.kind, sizeof(cur.kind));
-            uint32_t sz = 0;
-            if (parse_json_u32(ln, "size", &sz)) cur.size = sz;
+            parse_json_str(ln, "what", cur.what, sizeof(cur.what));
+            uint32_t v = 0;
+            if (parse_json_u32(ln, "size", &v)) cur.size = v;
+            if (parse_json_u32(ln, "stars", &v)) cur.stars = (uint16_t)(v > 65535 ? 65535 : v);
             char chip_s[16];
             if (parse_json_str(ln, "chip", chip_s, sizeof(chip_s))) {
                 if (strcmp(chip_s, "new") == 0) cur.chip = CHIP_NEW;
@@ -606,9 +681,34 @@ static bool ci_contains(const char *hay, const char *needle) {
     return false;
 }
 
-static void rebuild_view() {
+static bool entry_matches(const HubEntry &e, CatId cat) {
+    if (filter_new_only && e.chip == CHIP_OLD) return false;
+    if (cat != CAT_ALL && kind_to_cat(e.kind) != cat) return false;
+    if (search_q[0] && !ci_contains(e.name, search_q) && !ci_contains(e.author, search_q) &&
+        !ci_contains(e.kind, search_q) && !ci_contains(e.what, search_q)) {
+        return false;
+    }
+    return true;
+}
+
+static void rebuild_view(CatId cat) {
     total_entries = 0;
     view_count = 0;
+    memset(cat_counts, 0, sizeof(cat_counts));
+
+    auto tally = [&](const HubEntry &e, int idx) {
+        if (filter_new_only && e.chip == CHIP_OLD) return;
+        if (search_q[0] && !ci_contains(e.name, search_q) && !ci_contains(e.author, search_q) &&
+            !ci_contains(e.kind, search_q) && !ci_contains(e.what, search_q)) {
+            return;
+        }
+        cat_counts[CAT_ALL]++;
+        cat_counts[kind_to_cat(e.kind)]++;
+        if (cat == CAT_ALL || kind_to_cat(e.kind) == cat) {
+            if (view_count < MAX_ENTRIES) view_idx[view_count++] = (uint16_t)idx;
+        }
+    };
+
     if (sd_ready() && SD.exists(INDEX_PATH)) {
         free_ram_buf();
         File idx = SD.open(INDEX_PATH, FILE_READ);
@@ -619,12 +719,7 @@ static void rebuild_view() {
             for (int i = 0; i < total_entries; i++) {
                 HubEntry e;
                 if (idx.read((uint8_t *)&e, sizeof(e)) != sizeof(e)) break;
-                if (filter_new_only && e.chip == CHIP_OLD) continue;
-                if (search_q[0] && !ci_contains(e.name, search_q) && !ci_contains(e.author, search_q) &&
-                    !ci_contains(e.kind, search_q)) {
-                    continue;
-                }
-                view_idx[view_count++] = (uint16_t)i;
+                tally(e, i);
             }
         }
         idx.close();
@@ -633,13 +728,7 @@ static void rebuild_view() {
     if (!ram_entries) return;
     total_entries = ram_count;
     for (int i = 0; i < total_entries; i++) {
-        const HubEntry &e = ram_entries[i];
-        if (filter_new_only && e.chip == CHIP_OLD) continue;
-        if (search_q[0] && !ci_contains(e.name, search_q) && !ci_contains(e.author, search_q) &&
-            !ci_contains(e.kind, search_q)) {
-            continue;
-        }
-        view_idx[view_count++] = (uint16_t)i;
+        tally(ram_entries[i], i);
     }
 }
 
@@ -657,72 +746,279 @@ static bool read_entry(int raw_idx, HubEntry *out) {
     return true;
 }
 
-static void draw_hub_list(int sel, int scroll) {
+// Crisp vector preview artwork for each firmware category inside (x, y, w, h)
+static void draw_cat_preview(CatId cat, int x, int y, int w, int h, uint16_t col, bool mini = false) {
+    lcd.fillRoundRect(x, y, w, h, 4, 0x0841);
+    lcd.drawRoundRect(x, y, w, h, 4, col);
+    int cx = x + w / 2;
+    int cy = y + h / 2;
+
+    if (cat == CAT_SYNTH) {
+        // Mini piano keys + sawtooth waveform
+        int kw = w - 10, kx = x + 5, ky = y + h - (mini ? 12 : 18);
+        int kh = mini ? 8 : 13;
+        int nkeys = mini ? 5 : 7;
+        int step = kw / nkeys;
+        for (int i = 0; i < nkeys; i++) {
+            lcd.fillRect(kx + i * step, ky, step - 1, kh, TFT_WHITE);
+            if (i != 2 && i != 6 && i + 1 < nkeys) {
+                lcd.fillRect(kx + i * step + step - 2, ky, 3, kh / 2 + 1, TFT_BLACK);
+            }
+        }
+        int wy = y + (mini ? 8 : 13);
+        int amp = mini ? 5 : 8;
+        lcd.drawLine(x + 6, wy + amp, cx - 6, wy - amp, col);
+        lcd.drawLine(cx - 6, wy - amp, cx - 6, wy + amp, col);
+        lcd.drawLine(cx - 6, wy + amp, cx + 8, wy - amp, col);
+        lcd.drawLine(cx + 8, wy - amp, cx + 8, wy + amp, col);
+        lcd.drawLine(cx + 8, wy + amp, x + w - 6, wy - amp, col);
+    } else if (cat == CAT_GROOVE) {
+        // 4x2 (mini) or 4x3 (full) step sequencer pad grid
+        int rows = mini ? 2 : 3;
+        int cols = 4;
+        int pw = (w - 14) / cols;
+        int ph = (h - 10) / rows;
+        int sx = x + (w - cols * pw) / 2 + 1;
+        int sy = y + (h - rows * ph) / 2 + 1;
+        static const uint8_t PAT[12] = {1, 0, 1, 1, 0, 1, 0, 1, 1, 1, 0, 1};
+        for (int r = 0; r < rows; r++) {
+            for (int c = 0; c < cols; c++) {
+                bool on = PAT[(r * cols + c) % 12];
+                uint16_t pc = on ? (c == 0 ? TFT_WHITE : col) : 0x2104;
+                lcd.fillRoundRect(sx + c * pw, sy + r * ph, pw - 2, ph - 2, 2, pc);
+            }
+        }
+    } else if (cat == CAT_DRUMS) {
+        // Drum pads + kick circle
+        lcd.drawCircle(cx - (mini ? 8 : 12), cy, mini ? 7 : 12, col);
+        lcd.fillCircle(cx - (mini ? 8 : 12), cy, mini ? 3 : 5, col);
+        int px = cx + (mini ? 2 : 4);
+        int sz = mini ? 7 : 11;
+        lcd.fillRoundRect(px, cy - sz - 1, sz, sz, 2, TFT_WHITE);
+        lcd.fillRoundRect(px + sz + 2, cy - sz - 1, sz, sz, 2, col);
+        lcd.fillRoundRect(px, cy + 2, sz, sz, 2, col);
+        lcd.fillRoundRect(px + sz + 2, cy + 2, sz, sz, 2, 0x3186);
+    } else if (cat == CAT_TRACKER) {
+        // Tracker pattern columns
+        int rows = mini ? 4 : 6;
+        int sy = y + 5;
+        int rh = (h - 10) / rows;
+        for (int r = 0; r < rows; r++) {
+            int ry = sy + r * rh;
+            uint16_t rc = (r == 1) ? TFT_WHITE : col;
+            lcd.fillRect(x + 5, ry, 8, rh - 2, rc);
+            lcd.fillRect(x + 16, ry, (w - 28) / 2, rh - 2, (r % 2 == 0) ? col : 0x2104);
+            lcd.fillRect(x + 19 + (w - 28) / 2, ry, (w - 28) / 2, rh - 2, (r % 2 == 1) ? col : 0x2104);
+        }
+    } else if (cat == CAT_OTHER) {
+        // Chords / Tools: 3 stacked harmonic bars + FM-1 badge
+        int bw = w - 16;
+        int bh = mini ? 4 : 6;
+        lcd.fillRoundRect(x + 8, y + 6, bw, bh, 2, col);
+        lcd.fillRoundRect(x + 8, y + 6 + bh + 3, bw - 8, bh, 2, TFT_WHITE);
+        lcd.fillRoundRect(x + 8, y + 6 + (bh + 3) * 2, bw - 4, bh, 2, col);
+    } else {
+        // ALL: Globe / Hub signal arcs + grid
+        lcd.drawCircle(cx, cy, mini ? 9 : 14, col);
+        lcd.drawFastHLine(cx - (mini ? 9 : 14), cy, mini ? 18 : 28, col);
+        lcd.drawFastVLine(cx, cy - (mini ? 9 : 14), mini ? 18 : 28, col);
+        lcd.drawEllipse(cx, cy, mini ? 5 : 7, mini ? 9 : 14, col);
+    }
+}
+
+// Word-wraps text in [x, x+w) using Font0 (6x8), starting at line `skip_lines`
+static int draw_wrapped(const char *s, int x, int y, int w, int max_lines, uint16_t fg, uint16_t bg,
+                        int skip_lines = 0) {
+    lcd.setFont(&fonts::Font0);
+    lcd.setTextSize(1);
+    lcd.setTextColor(fg, bg);
+    int max_chars = w / 6;
+    if (max_chars < 4) max_chars = 4;
+    if (max_chars > 38) max_chars = 38;
+
+    int drawn = 0, line_idx = 0;
+    const char *p = s;
+    while (*p && drawn < max_lines) {
+        while (*p == ' ') p++;
+        if (!*p) break;
+        int len = 0, last_sp = -1;
+        while (p[len] && p[len] != '\n' && len < max_chars) {
+            if (p[len] == ' ') last_sp = len;
+            len++;
+        }
+        if (p[len] && p[len] != '\n' && last_sp > 0) len = last_sp;
+        char buf[40];
+        memcpy(buf, p, len);
+        buf[len] = 0;
+        if (line_idx >= skip_lines) {
+            lcd.setCursor(x, y + drawn * 10);
+            lcd.print(buf);
+            drawn++;
+        }
+        line_idx++;
+        p += len;
+        if (*p == '\n') p++;
+    }
+    return drawn;
+}
+
+static void draw_category_menu(int sel) {
     lcd.startWrite();
     lcd.fillScreen(TFT_BLACK);
     lcd.setFont(&fonts::Font0);
     lcd.setTextSize(1);
     lcd.setTextColor(ui::CYAN, TFT_BLACK);
-    lcd.setCursor(2, 2);
-    char hdr[41];
-    snprintf(hdr, sizeof(hdr), "thefirmwarehub.com [%s] (%d)", filter_new_only ? "NEW" : "ALL", view_count);
-    lcd.print(hdr);
-    if (search_q[0]) {
-        lcd.setTextColor(ui::GREEN, TFT_BLACK);
-        lcd.setCursor(2, 12);
-        lcd.printf("Filter: %s", search_q);
-    } else {
-        lcd.setTextColor(ui::GREY, TFT_BLACK);
-        lcd.setCursor(2, 12);
-        lcd.print("C:chip  /:search  U:update  W:wifi");
+    lcd.setCursor(4, 3);
+    lcd.print("thefirmwarehub.com");
+    lcd.setTextDatum(top_right);
+    lcd.setTextColor(filter_new_only ? ui::GREEN : ui::ORANGE, TFT_BLACK);
+    lcd.drawString(filter_new_only ? "[NEW 0xB36014]" : "[ALL CHIPS]", 236, 3);
+    lcd.setTextDatum(top_left);
+    lcd.drawFastHLine(0, 14, 240, 0x2104);
+
+    // 2 rows x 3 cols of category cards
+    for (int i = 0; i < CAT_COUNT; i++) {
+        int col = i % 3;
+        int row = i / 3;
+        int x = 4 + col * 78;
+        int y = 18 + row * 47;
+        int w = 74, h = 43;
+        bool active = (i == sel);
+        uint16_t ac = CAT_COLORS[i];
+        uint16_t bg = active ? 0x1082 : TFT_BLACK;
+        if (active) {
+            lcd.fillRoundRect(x, y, w, h, 5, bg);
+            lcd.drawRoundRect(x, y, w, h, 5, ac);
+            lcd.drawRoundRect(x + 1, y + 1, w - 2, h - 2, 4, ac);
+        } else {
+            lcd.drawRoundRect(x, y, w, h, 5, 0x3186);
+        }
+        draw_cat_preview((CatId)i, x + 5, y + 5, 24, 20, active ? ac : ui::GREY, true);
+        lcd.setFont(&fonts::Font0);
+        lcd.setTextSize(1);
+        lcd.setTextColor(active ? TFT_WHITE : ui::GREY, bg);
+        lcd.setCursor(x + 33, y + 7);
+        lcd.printf("%d", cat_counts[i]);
+        lcd.setTextColor(active ? ac : TFT_LIGHTGREY, bg);
+        lcd.setCursor(x + 5, y + 30);
+        lcd.print(CAT_NAMES[i]);
     }
-    lcd.drawFastHLine(0, 22, 240, 0x2104);
+
+    lcd.drawFastHLine(0, 114, 240, 0x2104);
+    lcd.setTextColor(CAT_COLORS[sel], TFT_BLACK);
+    lcd.setCursor(4, 117);
+    if (search_q[0]) {
+        lcd.printf("Search: %-16.16s  /:clr", search_q);
+    } else {
+        lcd.print(CAT_SUBS[sel]);
+    }
+    lcd.setTextColor(TFT_YELLOW, TFT_BLACK);
+    lcd.setCursor(4, 126);
+    lcd.print("ENTER open  C chip  / search  U upd  W wifi");
+    lcd.endWrite();
+}
+
+static void draw_fw_browser(CatId cat, int sel, int scroll) {
+    lcd.startWrite();
+    lcd.fillScreen(TFT_BLACK);
+    lcd.setFont(&fonts::Font0);
+    lcd.setTextSize(1);
+    lcd.setTextColor(CAT_COLORS[cat], TFT_BLACK);
+    lcd.setCursor(3, 3);
+    lcd.printf("%s (%d)", CAT_NAMES[cat], view_count);
+    lcd.setTextDatum(top_right);
+    lcd.setTextColor(filter_new_only ? ui::GREEN : ui::ORANGE, TFT_BLACK);
+    lcd.drawString(filter_new_only ? "[NEW]" : "[ALL]", 237, 3);
+    lcd.setTextDatum(top_left);
+    lcd.drawFastHLine(0, 13, 240, 0x2104);
 
     if (view_count == 0) {
         lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-        lcd.setCursor(4, 42);
-        lcd.print(total_entries == 0 ? "No catalog. Press U to download." : "No matching firmwares.");
-        lcd.setCursor(4, 56);
-        lcd.print("Press W to select Wi-Fi SSID.");
+        lcd.setCursor(6, 40);
+        lcd.print(total_entries == 0 ? "No catalog loaded." : "No matching firmwares.");
+        lcd.setCursor(6, 54);
+        lcd.print("Press U to update or C to show ALL.");
         lcd.setTextColor(TFT_YELLOW, TFT_BLACK);
-        lcd.setCursor(2, 124);
-        lcd.print("W wifi  U update  C filter  ESC back");
+        lcd.setCursor(4, 125);
+        lcd.print("U update  C chip  ESC categories");
         lcd.endWrite();
         return;
     }
 
+    // Left pane: Firmware list (x = 0..108)
+    lcd.drawFastVLine(109, 14, 105, 0x2104);
     static constexpr int VISIBLE = 9;
     File idx;
     bool use_sd = sd_ready() && SD.exists(INDEX_PATH);
     if (use_sd) idx = SD.open(INDEX_PATH, FILE_READ);
+
+    HubEntry sel_entry{};
     for (int i = 0; i < VISIBLE && scroll + i < view_count; i++) {
         HubEntry e{};
+        int raw = view_idx[scroll + i];
         if (use_sd && idx) {
-            uint32_t off = sizeof(IndexHeader) + (uint32_t)view_idx[scroll + i] * sizeof(HubEntry);
+            uint32_t off = sizeof(IndexHeader) + (uint32_t)raw * sizeof(HubEntry);
             idx.seek(off);
             idx.read((uint8_t *)&e, sizeof(e));
-        } else if (ram_entries && view_idx[scroll + i] < ram_count) {
-            e = ram_entries[view_idx[scroll + i]];
+        } else if (ram_entries && raw < ram_count) {
+            e = ram_entries[raw];
         }
-        int y = 25 + i * 11;
-        if (scroll + i == sel) {
-            lcd.fillRect(0, y - 1, 240, 10, 0x0210);
+        if (scroll + i == sel) sel_entry = e;
+
+        int y = 16 + i * 11;
+        bool active = (scroll + i == sel);
+        if (active) {
+            lcd.fillRect(0, y - 1, 108, 10, 0x0210);
             lcd.setTextColor(TFT_WHITE, 0x0210);
         } else {
             lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
         }
-        const char *tag = e.chip == CHIP_OLD ? "OLD" : (e.chip == CHIP_NEW ? "NEW" : "ANY");
-        char line[41];
-        snprintf(line, sizeof(line), "%c%-17.17s %-8.8s %-8.8s %s", scroll + i == sel ? '>' : ' ', e.name, e.version,
-                 e.author, tag);
+        char line[19];
+        snprintf(line, sizeof(line), "%c%-16.16s", active ? '>' : ' ', e.name);
         lcd.setCursor(2, y);
         lcd.print(line);
     }
     if (idx) idx.close();
 
+    // Right pane: Live Preview Card & Description (x = 112..238)
+    CatId ecat = kind_to_cat(sel_entry.kind);
+    uint16_t ecol = CAT_COLORS[ecat];
+    draw_cat_preview(ecat, 113, 16, 46, 36, ecol, true);
+
+    lcd.setFont(&fonts::Font0);
+    lcd.setTextSize(1);
+    lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+    lcd.setCursor(163, 17);
+    lcd.printf("%-12.12s", sel_entry.name);
+    lcd.setTextColor(ecol, TFT_BLACK);
+    lcd.setCursor(163, 27);
+    lcd.printf("v%-11.11s", sel_entry.version);
     lcd.setTextColor(TFT_YELLOW, TFT_BLACK);
-    lcd.setCursor(2, 124);
-    lcd.print(";/ . move  ENTER select  W wifi  ESC");
+    lcd.setCursor(163, 37);
+    lcd.printf("*%u %luK", (unsigned)sel_entry.stars, (unsigned long)(sel_entry.size / 1024));
+
+    const char *chip_tag = sel_entry.chip == CHIP_OLD ? "OLD" : (sel_entry.chip == CHIP_NEW ? "NEW" : "ANY");
+    uint16_t chip_col = sel_entry.chip == CHIP_OLD ? ui::RED : ui::GREEN;
+    lcd.setTextColor(chip_col, TFT_BLACK);
+    lcd.setCursor(163, 47);
+    lcd.printf("[%s] %-7.7s", chip_tag, sel_entry.kind);
+
+    lcd.setTextColor(ui::GREY, TFT_BLACK);
+    lcd.setCursor(113, 56);
+    lcd.printf("By %-17.17s", sel_entry.author);
+
+    if (sel_entry.what[0]) {
+        draw_wrapped(sel_entry.what, 113, 68, 125, 5, TFT_LIGHTGREY, TFT_BLACK);
+    } else {
+        lcd.setTextColor(ui::GREY, TFT_BLACK);
+        lcd.setCursor(113, 72);
+        lcd.print("Press ENTER for details");
+    }
+
+    lcd.drawFastHLine(0, 120, 240, 0x2104);
+    lcd.setTextColor(TFT_YELLOW, TFT_BLACK);
+    lcd.setCursor(3, 124);
+    lcd.print(";/ . move   ENTER details   ESC back");
     lcd.endWrite();
 }
 
@@ -862,22 +1158,69 @@ static bool download_firmware(const HubEntry &e, char *dst_path, size_t dst_len)
 }
 
 static void show_detail(const HubEntry &e) {
-    ui::clear_log();
-    ui::console(e.name, ui::CYAN);
-    ulog("Version: %s", e.version);
-    ulog("Maker:   %s", e.author);
-    ulog("Kind:    %s (%lu KB)", e.kind, (unsigned long)(e.size / 1024));
-    ulog("Chip:    %s", e.chip == CHIP_OLD ? "OLD 0x856014 ONLY"
-                        : (e.chip == CHIP_NEW ? "NEW 0xB36014 OK" : "ANY (0x856014/0xB36014)"));
-    ulog("Hub:     thefirmwarehub.com");
-    if (e.chip == CHIP_OLD) ulog("WARN: marked OLD chip only!");
-    ui::status("ENTER download   ESC back");
+    CatId cat = kind_to_cat(e.kind);
+    uint16_t col = CAT_COLORS[cat];
+    int desc_scroll = 0;
+
+    auto draw_detail = [&]() {
+        lcd.startWrite();
+        lcd.fillScreen(TFT_BLACK);
+        // Left preview card (4..82)
+        draw_cat_preview(cat, 4, 4, 78, 56, col, false);
+
+        lcd.setFont(&fonts::Font0);
+        lcd.setTextSize(1);
+        lcd.setTextColor(e.chip == CHIP_OLD ? ui::RED : ui::GREEN, TFT_BLACK);
+        lcd.setCursor(4, 65);
+        lcd.print(e.chip == CHIP_OLD ? "OLD 0x856014" : (e.chip == CHIP_NEW ? "NEW 0xB36014" : "ANY CHIP OK"));
+        lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+        lcd.setCursor(4, 77);
+        lcd.printf("Kind: %s", e.kind[0] ? e.kind : "other");
+        lcd.setCursor(4, 89);
+        lcd.printf("Size: %lu KB", (unsigned long)(e.size / 1024));
+        lcd.setTextColor(TFT_YELLOW, TFT_BLACK);
+        lcd.setCursor(4, 101);
+        lcd.printf("Stars: %u", (unsigned)e.stars);
+
+        // Right header & full description (88..237)
+        lcd.setTextColor(col, TFT_BLACK);
+        lcd.setCursor(88, 4);
+        lcd.printf("%.24s", e.name);
+        lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+        lcd.setCursor(88, 15);
+        lcd.printf("v%-10.10s by %.11s", e.version, e.author);
+        lcd.drawFastHLine(88, 26, 150, 0x2104);
+
+        const char *desc = e.what[0] ? e.what : "Open-source FM-1 firmware from thefirmwarehub.com.";
+        draw_wrapped(desc, 88, 31, 150, 8, TFT_LIGHTGREY, TFT_BLACK, desc_scroll);
+
+        lcd.drawFastHLine(0, 117, 240, 0x2104);
+        lcd.setTextColor(TFT_YELLOW, TFT_BLACK);
+        lcd.setCursor(4, 123);
+        lcd.print("ENTER download & flash  ;/. scroll  ESC");
+        lcd.endWrite();
+    };
+
+    draw_detail();
     ui::wait_released();
     for (;;) {
         int k = ui::read_key();
+        if (!k) {
+            delay(15);
+            continue;
+        }
         if (k == 27) return;
-        if (k == '\n') break;
-        delay(20);
+        if (k == ';' || k == 'k' || k == ',') {
+            if (desc_scroll > 0) {
+                desc_scroll--;
+                draw_detail();
+            }
+        } else if (k == '.' || k == 'j' || k == '/') {
+            desc_scroll++;
+            draw_detail();
+        } else if (k == '\n') {
+            break;
+        }
     }
 
     char path[128];
@@ -903,6 +1246,60 @@ static void show_detail(const HubEntry &e) {
     }
 }
 
+static void browse_category(CatId cat) {
+    rebuild_view(cat);
+    int sel = 0, scroll = 0;
+    static constexpr int VISIBLE = 9;
+    draw_fw_browser(cat, sel, scroll);
+    ui::wait_released();
+
+    for (;;) {
+        int k = ui::read_key();
+        if (!k) {
+            delay(15);
+            continue;
+        }
+        if (k == 27) {
+            ui::wait_released();
+            return;
+        }
+        if (k == 'c') {
+            filter_new_only = !filter_new_only;
+            rebuild_view(cat);
+            sel = scroll = 0;
+            draw_fw_browser(cat, sel, scroll);
+        } else if (k == 'u') {
+            if (fetch_catalog()) rebuild_view(cat);
+            sel = scroll = 0;
+            draw_fw_browser(cat, sel, scroll);
+            ui::wait_released();
+        } else if (k == '/' || k == 's') {
+            prompt_text("Search Hub", "Name / Author / Desc (empty=all):", search_q, sizeof(search_q), false);
+            rebuild_view(cat);
+            sel = scroll = 0;
+            draw_fw_browser(cat, sel, scroll);
+            ui::wait_released();
+        } else if (view_count > 0) {
+            if (k == ';' || k == 'k' || k == ',') {
+                if (sel > 0) sel--;
+                if (sel < scroll) scroll = sel;
+                draw_fw_browser(cat, sel, scroll);
+            } else if (k == '.' || k == 'j') {
+                if (sel + 1 < view_count) sel++;
+                if (sel >= scroll + VISIBLE) scroll = sel - VISIBLE + 1;
+                draw_fw_browser(cat, sel, scroll);
+            } else if (k == '\n') {
+                static HubEntry e;
+                if (read_entry(view_idx[sel], &e)) {
+                    show_detail(e);
+                }
+                draw_fw_browser(cat, sel, scroll);
+                ui::wait_released();
+            }
+        }
+    }
+}
+
 void debug_test() {
     ulog("=== HUB DEBUG TEST ===");
     ulog("Free heap: %lu, MaxAlloc: %lu", (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getMaxAllocHeap());
@@ -920,6 +1317,7 @@ void debug_test() {
     if (!fetch_catalog()) {
         ulog("fetch_catalog() failed");
     } else {
+        rebuild_view(CAT_ALL);
         ulog("fetch_catalog() OK: total=%d", total_entries);
     }
     HubEntry test_e{};
@@ -935,18 +1333,17 @@ void debug_test() {
 }
 
 void run() {
-    rebuild_view();
+    rebuild_view(CAT_ALL);
 
-    // Always connect Wi-Fi / show SSID selection when entering Wi-Fi Hub if not yet loaded
+    // Always connect Wi-Fi / fetch catalog on first entry if no cache yet
     if (total_entries == 0) {
         if (fetch_catalog()) {
-            rebuild_view();
+            rebuild_view(CAT_ALL);
         }
     }
 
-    int sel = 0, scroll = 0;
-    static constexpr int VISIBLE = 9;
-    draw_hub_list(sel, scroll);
+    int cat_sel = 0;
+    draw_category_menu(cat_sel);
     ui::wait_released();
 
     for (;;) {
@@ -960,45 +1357,35 @@ void run() {
             ui::wait_released();
             return;
         }
-        if (k == 'c') {
+        if (k == ',' || k == 'a' || k == 'h') {
+            cat_sel = (cat_sel + CAT_COUNT - 1) % CAT_COUNT;
+            draw_category_menu(cat_sel);
+        } else if (k == '/' || k == 'd' || k == 'l') {
+            cat_sel = (cat_sel + 1) % CAT_COUNT;
+            draw_category_menu(cat_sel);
+        } else if (k == ';' || k == 'w' || k == 'k') {
+            cat_sel = (cat_sel + CAT_COUNT - 3) % CAT_COUNT;
+            draw_category_menu(cat_sel);
+        } else if (k == '.' || k == 's' || k == 'j') {
+            cat_sel = (cat_sel + 3) % CAT_COUNT;
+            draw_category_menu(cat_sel);
+        } else if (k == 'c') {
             filter_new_only = !filter_new_only;
-            rebuild_view();
-            sel = scroll = 0;
-            draw_hub_list(sel, scroll);
+            rebuild_view((CatId)cat_sel);
+            draw_category_menu(cat_sel);
         } else if (k == 'u') {
-            if (fetch_catalog()) rebuild_view();
-            sel = scroll = 0;
-            draw_hub_list(sel, scroll);
+            if (fetch_catalog()) rebuild_view((CatId)cat_sel);
+            draw_category_menu(cat_sel);
             ui::wait_released();
         } else if (k == 'w') {
-            if (wifi_setup_ui()) {
-                if (fetch_catalog()) rebuild_view();
-            }
-            draw_hub_list(sel, scroll);
+            if (wifi_setup_ui() && fetch_catalog()) rebuild_view((CatId)cat_sel);
+            draw_category_menu(cat_sel);
             ui::wait_released();
-        } else if (k == '/' || k == 's') {
-            prompt_text("Search Hub", "Name / Author / Kind (empty=all):", search_q, sizeof(search_q), false);
-            rebuild_view();
-            sel = scroll = 0;
-            draw_hub_list(sel, scroll);
+        } else if (k == '\n') {
+            browse_category((CatId)cat_sel);
+            rebuild_view((CatId)cat_sel);
+            draw_category_menu(cat_sel);
             ui::wait_released();
-        } else if (view_count > 0) {
-            if (k == ';' || k == 'k' || k == ',') {
-                if (sel > 0) sel--;
-                if (sel < scroll) scroll = sel;
-                draw_hub_list(sel, scroll);
-            } else if (k == '.' || k == 'j') {
-                if (sel + 1 < view_count) sel++;
-                if (sel >= scroll + VISIBLE) scroll = sel - VISIBLE + 1;
-                draw_hub_list(sel, scroll);
-            } else if (k == '\n') {
-                static HubEntry e;
-                if (read_entry(view_idx[sel], &e)) {
-                    show_detail(e);
-                }
-                draw_hub_list(sel, scroll);
-                ui::wait_released();
-            }
         }
     }
 }
