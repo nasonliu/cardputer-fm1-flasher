@@ -1,155 +1,89 @@
-# Synth rescue for the M5Stack Cardputer ADV
+# FM-1 Flasher & Wi-Fi Hub for M5Stack Cardputer ADV
 
-Brings a bricked M-VAVE FM-1 or SMK-37 (JieLi AC791N / WL82) back to life with
-nothing but an [M5Stack Cardputer ADV](https://docs.m5stack.com/en/core/Cardputer-Adv)
-and a USB-C cable: no computer, no extra hardware.
+Turn your **[M5Stack Cardputer ADV](https://docs.m5stack.com/en/core/Cardputer-Adv)** (ESP32-S3) into a **completely standalone online firmware browser and flasher for the M-VAVE FM-1** pocket synthesizer — **no computer, phone, or browser required**.
 
-The Cardputer puts the unit into its ROM download mode through its own USB-C
-port, becomes the USB host, starts
-[M-Flasher](https://github.com/jvitkauskas/m-flasher)'s flash loader (bundled,
-MIT, from [m-bootloader](https://github.com/jvitkauskas/m-bootloader)), backs
-the whole 1 MiB flash up to the SD card, and installs a fresh
-m-bootloader with no firmware: the unit then waits in m-bootloader's MIDI mode
-and takes a firmware from that firmware's installer, from a phone or computer.
+Browse the latest open-source firmwares on **[The Firmware Hub](https://thefirmwarehub.com)** over Wi-Fi, download `.fwsc` packages straight to your microSD card with SHA-256 verification, and flash them directly into your FM-1 over USB-C.
 
-- **Guided mode** (the default): one step a screen, a picture, a few large
-  words and one key a step (below).
-- **Advanced mode**: the log on screen, each step under your control,
-  self-tests, and a hand-off to a PC for other tools.
+---
 
-The rescue is a clean install: the boot area is written and every other sector
-up to `0xFEFFF` is erased (no leftovers of earlier firmwares); `0xFF000`-`0xFFFFF`, and on the
-SMK-37 `0xC0000`-`0xC1FFF` (Bluetooth pairing, factory calibration), are never
-touched. It backs up first (or, without an SD card, warns and goes on only if
-told to), writes only what differs, and verifies every run with the chip's
-CRC32 and the whole range at the end. Before anything is written the app
-identifies the unit with M-Flasher's evidence (the SMK-37's calibration record
-at `0xC1224` / `0xFF000`, then the flash ID: FM-1 `856014`/`B36014`, SMK-37
-`EB6014`) and installs that board's image. See [rescue/README.md](rescue/README.md).
+## Key Features
 
-A log is kept on the SD card in `/fm1/log.txt`, backups in
-`/fm1/backup-NNN.bin` (with a `.txt` describing the unit).
+- **Standalone Wi-Fi Firmware Hub (`thefirmwarehub.com`)**
+  - Scan & select 2.4 GHz Wi-Fi networks directly on the Cardputer (credentials saved in NVS & `/fm1/wifi.txt`).
+  - Stream and index the live catalog from `https://thefirmwarehub.com/catalog.json` (200+ firmwares) with search (`/`), chip filter (`C`), and catalog refresh (`U`).
+  - Download `.fwsc` firmware packages to `/fm1/firmware/` with automatic **SHA-256** verification, then flash immediately.
+- **Full Support for New & Old FM-1 Hardware**
+  - Supports both the newer **UC25HQ80 (`0xB36014`)** flash chip (2026+ units) and the older **P25Q80H (`0x856014`)** flash chip (plus SMK-37 `0xEB6014` rescue).
+  - Hub view defaults to filtering firmwares compatible with `0xB36014` (`[NEW]`), toggleable to `[ALL]`.
+- **SD Card `.fwsc` & `.bin` Flasher**
+  - Low-RAM streaming UFW/FWSC de-interleaver and `chip_key` (`0x980F`) CRC16 verifier.
+  - Mandatory 1 MiB flash backup (`/fm1/backup-NNN.bin`) before any write.
+  - Preserves the bootloader (`0x00000–0x03FFF`) and factory calibration / `key_mac` (`0xFF000–0xFFFFF`), with post-write CRC32 verification.
+- **Dual USB-C OTG Entry Modes**
+  - **Powered-on FM-1**: Automatically sends USB-MIDI SysEx soft-key (`F0 22 24 35 7D F7`) to enter `WL82 UBOOT1.00` without turning the synth off.
+  - **Powered-off or bricked FM-1**: Sends JieLi `0x16EF` `USB_KEY` + hardware-timed RMT 4 us calibration pulses.
+- **Graphical Icon Menu**
+  - Navigate the 4-card home screen with Cardputer arrow keys (`,` `/` `;` `.`) and `ENTER` (or `G0`):
+    1. **Wi-Fi Hub** — Online firmware catalog & downloader
+    2. **SD Flash** — Flash `.fwsc` / `.bin` files from `/fm1/firmware/`, `/fm1/`, or `/`
+    3. **Rescue** — Guided unbrick & `m-bootloader` installer
+    4. **Advanced** — Console log, manual backup, USB-MIDI soft-key, PC handoff, and pin/pulse self-tests
+- **Developer-Friendly USB Serial**
+  - ESP32-S3 USB-Serial/JTAG stays active in all menus and Wi-Fi Hub so `pio run -t upload` works automatically without holding `G0` (USB pins are only detached during active FM-1 flashing).
 
-**Status** (2026-11-12): works on an FM-1 and an SMK-37 Pro, tested on real
-bricks: both with the stock bootloader and their firmware's start erased (as
-an interrupted update leaves a unit: on the SMK-37 only its bootloader's update
-loader shows up on USB), and an FM-1 with the stock bootloader and a firmware
-that hangs on its first instruction (nothing on USB at all). Each was backed
-up and repaired; a backup reads 1 MiB in about 2 s and matches the chip's
-CRC32, a repair takes 2 to 8 s.
+---
 
 ## Install
 
-Download `synth-rescue-vX.Y.Z-cardputer-adv.bin` from the
-[releases](../../releases): one merged image (bootloader, partition table and
-app; it goes at `0x0`).
+Download `firmware.factory.bin` (merged image for offset `0x0`) or `firmware.bin` (app-only for `0x10000`) from **[Releases](../../releases)**.
 
-- **From an SD card, with [M5Launcher](https://github.com/bmorcelli/Launcher)**
-  (no computer needed once Launcher is on the Cardputer): copy the `.bin` to
-  the card (FAT32, 32 GB or less), open Launcher, choose SD, the file, and
-  Install. The same card then holds the backups (`/fm1/`). Launcher's own key
-  at power-on gets you back to it.
-- **With esptool** from a computer: the Cardputer in download mode (power
-  switch OFF, hold G0, plug in USB-C), then
-  `esptool --chip esp32s3 write-flash 0x0 synth-rescue-vX.Y.Z-cardputer-adv.bin`.
+- **Via [M5Launcher](https://github.com/bmorcelli/Launcher) (SD card, no PC)**:
+  Copy `firmware.factory.bin` to a FAT32 microSD card, open M5Launcher, select the file, and install.
+- **Via `esptool` from a computer**:
+  Put the Cardputer ADV into download mode (hold `G0`, press `Reset` or plug USB-C), then run:
+  ```bash
+  esptool --chip esp32s3 write-flash 0x0 firmware.factory.bin
+  ```
 
-The app takes over the Cardputer's USB-C port for the unit, so to install
-something else later from a computer, use download mode again (or Launcher).
+---
 
-## How it works
+## Usage
 
-The USB-C D+/D- are the ESP32-S3's native USB pins (GPIO20/GPIO19). The app
-detaches the internal USB PHY and uses them as GPIOs (`src/usbkey.cpp`):
+1. Insert a **FAT32 microSD card** (used to store `/fm1/hub_index.dat`, downloaded `.fwsc` files in `/fm1/firmware/`, and automatic backups `/fm1/backup-NNN.bin`).
+2. Power on the Cardputer ADV and use `,` / `/` (or `;` / `.`) + `ENTER` on the home screen:
+   - **Wi-Fi Hub**: Pick your 2.4 GHz Wi-Fi network, browse the firmware list (`;` / `.`), press `ENTER` to inspect details, `ENTER` to download & verify SHA-256, and `ENTER` to flash.
+   - **SD Flash**: Pick any `.fwsc` or `.bin` on the SD card and connect your FM-1 via a USB-C to USB-C cable (either already powered ON for USB-MIDI soft-key, or powered OFF and switched ON when prompted).
+   - **Rescue**: Guided step-by-step unbricking for dead FM-1 / SMK-37 units.
 
-1. Sends the key `0x16EF` (D+ clock, D- data, MSB first) until the ROM answers.
-2. ROM ACK (D- held low), then the ROM pulls D+ up.
-3. 4 us low pulses on D+ every 1 ms, from the RMT peripheral (hardware-timed).
-   The ROM calibrates its USB clock from them.
-4. Stops when D+ drops after >= 1 s or after 6 s.
+---
 
-Then the pins go to the ESP32-S3's USB host (`src/uboot_host.cpp`: Bulk-Only
-Transport), and `src/jl.cpp` (a port of M-Flasher's `jl.rs`) uploads the
-loader through the ROM and reads, erases and writes the flash
-(`src/writer.cpp`: the rescue).
+## Build from Source
 
-| Path | What |
-|---|---|
-| `src/usbkey.cpp` | USB_KEY, calibration pulses, self-tests |
-| `src/uboot_host.cpp` | USB host, Bulk-Only Transport |
-| `src/jl.cpp`, `src/mflr_loader.h` | ROM and loader protocol; M-Flasher's loader (MIT) |
-| `src/writer.cpp` | the rescue install |
-| `src/engine.cpp` | download mode, connection, the unit's model, backup: both modes' work |
-| `src/guided.cpp`, `src/advanced.cpp` | the two modes |
-| `src/ui.cpp`, `src/art.cpp`, `art/` | screen, keys, log; the guided mode's pictures |
-| `rescue/` | the rescue images (FM-1, SMK-37), their provenance and licences |
-| `tools/make_rescue_image.sh` | rebuilds the rescue image with M-Flasher's code |
-| `tools/make_art.py` | `art/generated/*.png` to the 100x100 pictures and their table |
-| `tools/make_fonts.py` | DejaVu Sans to the guided mode's fonts (`src/ui_fonts.h`) |
-
-Timings follow [FM-1-transporter](https://github.com/kurogedelic/FM-1-transporter)
-and [flipper-fm1-recovery](https://github.com/merthsoft/flipper-fm1-recovery) v0.7.
-
-## Build and flash
-
-PlatformIO (pioarduino platform, Arduino-ESP32 3.x):
+Built with PlatformIO (`pioarduino` / Arduino-ESP32 3.x):
 
 ```bash
-pio run                      # .pio/build/cardputer-adv/firmware.factory.bin = merged image
-pio run -t upload
+pio run              # builds .pio/build/cardputer-adv/firmware.bin and firmware.factory.bin
+pio run -t upload    # flashes connected Cardputer ADV automatically when in menus
 ```
 
-The stock Arduino-ESP32 libraries are enough. Their ESP-IDF has
-`CONFIG_USB_HOST_ENABLE_ENUM_FILTER_CALLBACK` set, which cancels every USB
-device unless a filter accepts it: `src/uboot_host.cpp` registers one.
+### Project Structure
 
-The app takes the USB port away from the USB serial interface, so later uploads
-need download mode: power switch OFF, hold G0, plug USB-C into the PC.
+| File | Purpose |
+|---|---|
+| `src/hub.cpp` | Wi-Fi setup, streaming `thefirmwarehub.com/catalog.json` indexer, SHA-256 downloader |
+| `src/flasher.cpp` | SD card `.fwsc` / `.bin` browser, backup, sector diff, and flash workflow |
+| `src/fw_file.cpp` | Streaming UFW/FWSC de-interleaver & `0x980F` app CRC16 verifier |
+| `src/usbkey.cpp` | JieLi `0x16EF` `USB_KEY`, RMT 4 us calibration pulses, and USB-Serial restore |
+| `src/uboot_host.cpp` | ESP32-S3 USB Host BOT (`4C4A:8057`) & USB-MIDI SysEx soft-key |
+| `src/jl.cpp`, `src/mflr_loader.h` | ROM & M-Flasher loader protocol |
+| `src/writer.cpp`, `src/engine.cpp` | Flash backup, `0xB36014`/`0x856014`/`0xEB6014` detection, safe sector writer |
+| `src/ui.cpp`, `src/guided.cpp`, `src/advanced.cpp` | Polled TCA8418 ADV keyboard driver, 4-card icon menu, guided & advanced UI |
 
-The merged `firmware.factory.bin` (flash at `0x0`) also works with M5Launcher
-from the SD card, or with esptool.
+---
 
-Releases are made by CI (`.github/workflows/build.yml`): every push builds the
-image (an artifact of the run); a tag `vX.Y.Z` that matches `APP_VERSION` in
-`platformio.ini` also makes the release, with the image and `SHA256SUMS`. To
-release: bump `APP_VERSION`, commit, `git tag vX.Y.Z`, push the tag.
+## Credits & Attribution
 
-## Use
-
-**Guided mode** (what it starts in): one step a screen, a picture, a few large
-words and the key that goes on. Each step has its own key, so a key pressed
-twice never skips one; everything else goes on by itself.
-
-1. **ENTER**: start. 2. Switch the synth off, **1**. 3. Connect the USB-C
-   cable, **2**. 4. An SD card for a backup (optional: the page shows whether
-   one is in), **3**. 5. Switch the synth on: the Cardputer connects and finds
-   out which unit it is. 6. The backup (or, without a card, **C** to go on
-   without one). 7. **Y**: repair. 8. Done: the unit restarts.
-
-A problem says what to do and has its own "try again" key; **V** shows the
-log; **ESC** goes back.
-
-**Advanced mode** (**A** on the first page): the log on screen and each step
-under your control:
-
-- **P** / **T** with nothing plugged in: pin check (`H3 L0`) and pulse test
-  (about 3000 edges, well under 500 ppm).
-- **ENTER**, then switch the unit on: when it says **Connected**, ENTER backs
-  up, W installs the rescue, R restarts the unit, ESC ends.
-- **H**: key only; on **MOVE CABLE TO PC**, move the cable to the PC, keeping
-  the unit on.
-
-Run on battery, with the unit off when you start.
-
-## Cautions
-
-- Measure the Cardputer's USB-C VBUS while on battery. If it outputs 5 V, use a
-  cable/adapter without VBUS: the unit should run from its own battery.
-- Only the repair writes the unit's flash (**Y** in the guided mode, **W** in
-  the advanced one), after a backup or the no-card warning, and a confirmation.
-- SD card: FAT32. It can go in at any time; the app mounts it when needed.
-
-## Licence
-
-MIT ([LICENSE](LICENSE)). The parts from elsewhere (the M-Flasher loader, the
-rescue images, the fonts, the libraries linked into the firmware) keep their
-own licences: see [THIRD-PARTY.md](THIRD-PARTY.md).
+- Firmware catalog & packages: **[The Firmware Hub](https://thefirmwarehub.com)** (`CC-BY-4.0`)
+- Base Cardputer ADV USB-key & rescue engine: **[jvitkauskas/cardputer-synth-rescue](https://github.com/jvitkauskas/cardputer-synth-rescue)**
+- Flash loader & bootloader: **[M-Flasher](https://github.com/jvitkauskas/m-flasher)** & **[m-bootloader](https://github.com/jvitkauskas/m-bootloader)** (`MIT`)
+- USB-key & calibration timings: **[FM-1-transporter](https://github.com/kurogedelic/FM-1-transporter)** & **[flipper-fm1-recovery](https://github.com/merthsoft/flipper-fm1-recovery)**
